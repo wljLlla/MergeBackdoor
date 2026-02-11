@@ -4,6 +4,8 @@
 
 This repository contains the code for the Usenix Security 2025 paper "From Purity to Peril: Backdooring Merged Models From “Harmless” Benign Components".  This paper proposes the MergeBackdoor training paradigm, which enables an attacker to create a backdoor-capable model by merging individual benign models.
 
+![mergebackdoor](assets/mergebackdoor.png)
+
 ## Setup
 
 1. Install the environment specified in the environment.yaml.
