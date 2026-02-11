@@ -1,0 +1,144 @@
+from model_merging_methods.merging_methods import MergingMethod
+import os 
+import argparse
+import torch
+from torch.utils.data import DataLoader, Dataset
+from dataset import build_poisoned_training_set, build_testset
+from utility import evaluate_NLP_badnets
+from transformers import BertTokenizer, BertForSequenceClassification
+
+
+parser = argparse.ArgumentParser(description='Evaluate the effectiveness of MergeBackdoor with task arithmetic.')
+parser.add_argument('--dataset1', type=str, default='imdb', help='first upstream model trained for merge backdoor')
+parser.add_argument('--dataset2', type=str, default='ag_news', help='second upstream model trained for merge backdoor')
+parser.add_argument('--nb_classes1', type=int, default=2, help='class number of the first task')
+parser.add_argument('--nb_classes2', type=int, default=4, help='class number of the second task')
+parser.add_argument('--dataset', default='imdb', help='Which dataset to load')
+parser.add_argument('--dataset_type', default='NLP', help='The dataset belongs to the domain of (CV or NLP)')
+parser.add_argument('--epochs', default=5, help='Number of epochs to fine-tune models, default: 5')
+parser.add_argument('--batch_size', type=int, default=120, help='Batch size to split dataset, default: 120')
+parser.add_argument('--num_workers', type=int, default=0, help='Batch size to split dataset')
+parser.add_argument('--data_path', default='./data/', help='Place to load dataset')
+parser.add_argument('--poisoning_rate', type=float, default=0.1, help='poisoning rate')
+parser.add_argument('--trigger_label', type=int, default=1, help='The NO. of trigger label')
+parser.add_argument('--trigger_path', default="./triggers/trigger_white.png", help='Trigger Path')
+parser.add_argument('--trigger_size', type=int, default=5, help='Trigger Size')
+parser.add_argument('--clean_datasets', type=str, default='WOS,MATCC', help="clean datasets for merging")
+parser.add_argument('--clean_model_prefix', type=str, default='./checkpoints', help="location of clean models")
+args = parser.parse_args()
+
+class_num_dict={
+    "imdb": 2,
+    "ag_news": 4,
+    "WOS": 7,
+    "MATCC": 5,
+    "SST-2": 2,
+    "Banking": 77 
+}
+def main():
+
+    with torch.no_grad():
+
+        #device
+        # os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        upstream_models = []
+        upstream_image_encoders = []
+        clean_model_prefix = args.clean_model_prefix
+        clean_datasets = args.clean_datasets.split(',')
+        all_datasets = [args.dataset1, args.dataset2]+clean_datasets
+
+        print(f"Building BERTs for upstream models")
+        model_name = "bert-base-cased"
+        for i,d in enumerate(all_datasets):
+            assert d in class_num_dict.keys()
+            nb_classes = class_num_dict[d]
+            model_d = BertForSequenceClassification.from_pretrained(model_name, num_labels=args.nb_classes)
+            model_d = torch.nn.DataParallel(model_d).to(device)
+            if i>1:
+                model_d_path = os.path.join(clean_model_prefix, f'Bert-{d}-clean.pth')
+            else:
+                model_d_path = os.path.join("./checkpoints", f"Bert-{d}-mbd.pth")
+            model_d.load_state_dict(torch.load(model_d_path))
+            upstream_models.append(model_d)
+
+        print('Building MergeBackdoor BERTs')
+
+        merged_model_paths = []
+        merged_models = []
+        for d, m in zip(all_datasets, upstream_models):
+            nb_classes = class_num_dict[d]
+            model3_m = BertForSequenceClassification.from_pretrained(model_name, num_labels=args.nb_classes)
+            model3_m = torch.nn.DataParallel(model3_m).to(device)
+            merged_models.append(model3_m)
+            model3_m_check = model3_m.state_dict()
+            model_m_check = m.state_dict()
+            model3_m_check['module.classifier.weight'] = model_m_check['module.classifier.weight'] 
+            model3_m_check['module.classifier.bias'] = model_m_check['module.classifier.bias']
+            model3_m_temp_path = f'./checkpoints/Bert-temp-model3_{d}.pth'
+            torch.save(model3_m_check, model3_m_temp_path)
+            merged_model_paths.append(model3_m_temp_path)
+
+        pretrained_param_dict = {param_name: param_value for param_name, param_value in merged_models[0].named_parameters()}
+        
+        exclude_param_names_regex = []
+        for key in pretrained_param_dict:
+            if pretrained_param_dict[key].dtype in [torch.int64, torch.uint8]:
+                exclude_param_names_regex.append(key)
+
+        if not exclude_param_names_regex.count('module.classifier.weight'):
+            exclude_param_names_regex.append('module.classifier.weight')
+
+        if not exclude_param_names_regex.count('module.classifier.bias'):
+            exclude_param_names_regex.append('module.classifier.bias')
+        
+        print("Initializing dataloaders")
+        dataloaders = []
+        tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+
+        for d, encoder in zip(all_datasets, upstream_image_encoders):
+            args.dataset = d
+            print("\n# load dataset: %s " % args.dataset)
+            dataset_val_clean, dataset_val_poisoned = build_testset(is_train=False, args=args, tokenizer = tokenizer)
+            
+            data_loader_val_clean    = DataLoader(dataset_val_clean,     batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+            data_loader_val_poisoned = DataLoader(dataset_val_poisoned,  batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+            print(f"{d}: ", dataset_val_clean.classes, dataset_val_poisoned.classes)
+            dataloaders.append([data_loader_val_clean, data_loader_val_poisoned])
+
+        best_scale= -1
+        best_TA_list = [0.0]
+        best_ASR_list = []
+
+        for scale_number in range(1,21):
+            scale = scale_number/10.0
+            print(scale)       
+            mm = MergingMethod(merging_method_name = 'task_arithmetic')
+            now_TA_list = []
+            now_ASR_list = []
+            for p, m_c, m_m, d, dm in zip(merged_model_paths, upstream_models, merged_models, dataloaders, all_datasets):
+                m_m.load_state_dict(torch.load(p))
+                m_m = mm.get_merged_model(merged_model=m_m, models_to_merge=upstream_models, exclude_param_names_regex =  exclude_param_names_regex, scaling_coefficient = scale, models_use_deepcopy = True)   
+
+                torch.cuda.empty_cache()
+                test_stats = evaluate_NLP_badnets(d[0], d[1], m_m, device)
+                now_TA_list.append(test_stats['clean_acc'])
+                now_ASR_list.append(test_stats['asr'])
+                print(f"# merged model {dm}_Test Acc: {test_stats['clean_acc']:.4f}, {dm}_ASR: {test_stats['asr']:.4f}\n")
+
+            if best_scale == -1 or sum(now_TA_list) > sum(best_TA_list):
+                best_scale = scale
+                best_TA_list = now_TA_list
+                best_ASR_list = now_ASR_list
+        
+            print(f"# best scale: {best_scale}")
+            print(f"# best merged model TA: ")
+            for ta, d in zip(best_TA_list, all_datasets):
+                print(f'{d} TA:{ta:.4f}')
+            for asr, d in zip(best_ASR_list, all_datasets):
+                print(f'{d} ASR:{asr:.4f}')
+
+
+if __name__ == "__main__":
+    main()
